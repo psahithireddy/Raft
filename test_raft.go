@@ -391,7 +391,14 @@ func (rf *Raft) sendHeartBeat() {
 		}
 		w++
 		time.Sleep(HEARTBEAT_INTERVAL * time.Millisecond) //manual delay for testing
+		if w%20 == 0 {
+			fmt.Println()
+			fmt.Println("------20 heartbeats have been sent----")
+			fmt.Println()
+		}
 		if w > 200 {
+			fmt.Println()
+			fmt.Println("Leader is unable to send heartbeat, new election should start after election delay")
 			time.Sleep(500 * time.Millisecond)
 		}
 	}
