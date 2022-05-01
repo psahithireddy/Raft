@@ -35,6 +35,8 @@ type Raft struct {
 	commitIndex       int
 	nextIndex         []int
 	matchIndex        []int
+	lastApplied       int
+	applyCh           chan ApplyMsg
 	doNotBecomeLeader bool //only for testing
 	doNotAppend       bool //only for testing
 }
@@ -44,6 +46,12 @@ type Entry struct {
 	Index   int
 	Command interface{}
 }
+
+type ApplyMsg struct {
+	Index   int
+	Command interface{}
+}
+
 type AppendEntriesArgs struct {
 	Term         int32
 	LeaderID     int
@@ -94,6 +102,7 @@ func (rf *Raft) CallElection() { // make yourself candidate, append current term
 	rf.state = CANDIDATE
 	rf.currentterm++
 	rf.votedfor = rf.me //need to enter me details
+	fmt.Println()
 	fmt.Println(rf.me, " is attempting election at term", rf.currentterm)
 
 	rf.mu.Unlock()
@@ -166,6 +175,8 @@ func (rf *Raft) broadcastAppendReq() {
 					}
 				}
 				if reply.Success {
+					fmt.Println()
+					fmt.Println()
 					fmt.Println("Node ", node.me, " appended ", node.logs)
 				}
 				finished++
@@ -294,6 +305,7 @@ func (rf *Raft) broadcastVoteReq() {
 		cond.Wait()
 	}
 	if count >= total/2 {
+		fmt.Println()
 		fmt.Println(rf.me, " won election at term ", rf.currentterm)
 		if cterm == rf.currentterm {
 			rf.state = LEADER
@@ -384,13 +396,15 @@ func (rf *Raft) sendHeartBeat() {
 
 }
 
-func Make(me int) *Raft {
+func Make(me int, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.me = me
 	rf.state = FOLLOWER
 	rf.votedfor = -1
 	rf.voteAcquired = 0
 	rf.currentterm = 0
+	rf.lastApplied = 0
+	rf.applyCh = applyCh //should get from input
 	return rf
 }
 
@@ -432,6 +446,7 @@ func (rf *Raft) startLoop() {
 			}
 			rf.CallElection()
 		}
+		go rf.applyLog()
 	}
 }
 
@@ -456,6 +471,21 @@ func (rf *Raft) updateCommitIndex() {
 		}
 	}
 }
+
+func (rf *Raft) applyLog() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.commitIndex > rf.lastApplied {
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			applyMsg := ApplyMsg{
+				Index:   i,
+				Command: rf.logs[i].Command,
+			}
+			rf.applyCh <- applyMsg
+		}
+	}
+}
+
 func getLeader(nodes []*Raft) *Raft {
 	for _, node := range nodes {
 		if atomic.LoadInt32(&node.state) == LEADER {
@@ -496,6 +526,7 @@ func testAppends(value int, nodes []*Raft) {
 }
 
 func printAllLogs(nodes []*Raft) {
+	fmt.Println()
 	fmt.Println("--------------Log Entries----------")
 
 	for _, node := range nodes {
@@ -507,12 +538,21 @@ func printAllLogs(nodes []*Raft) {
 	fmt.Println("-----------------------------------")
 }
 
+func consumeApply(applyCh chan ApplyMsg) {
+	for {
+		<-applyCh
+	}
+
+}
+
 func main() {
 	nodes := []*Raft{}
 	numberOfNodes := 5
 	for i := 0; i < numberOfNodes; i++ {
-		rf := Make(i)
+		applyCh := make(chan ApplyMsg)
+		rf := Make(i, applyCh)
 		nodes = append(nodes, rf)
+		go consumeApply(applyCh)
 	}
 	for _, node := range nodes {
 		node.othernodes = nodes
@@ -527,6 +567,9 @@ func main() {
 		}
 		go node.startLoop()
 	}
+	fmt.Println()
+	fmt.Println("------Testing Log replication--------------")
+
 	for i := 0; i < 20; i++ {
 		testAppends(i, nodes)
 		fmt.Println("Sending append command: ", i)
@@ -535,6 +578,9 @@ func main() {
 	}
 	time.Sleep(10 * time.Millisecond)
 	nodes[4].doNotAppend = true
+	fmt.Println()
+	fmt.Println()
+	fmt.Println("------Testing Log replication on failed/network partitioned node through a election--------------")
 	time.Sleep(time.Duration(1000) * time.Millisecond)
 	for i := 20; i < 40; i++ {
 		testAppends(i, nodes)
@@ -544,7 +590,9 @@ func main() {
 	}
 	time.Sleep(time.Duration(10000) * time.Millisecond)
 	nodes[4].doNotAppend = false
+	fmt.Println()
 	fmt.Println("DonotAppend made false")
+
 	for {
 	}
 }
