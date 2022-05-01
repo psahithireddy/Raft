@@ -29,9 +29,34 @@ type Raft struct {
 	currentterm   int32
 	votedfor      int
 	voteAcquired  int
-	heartbeat     int32
 	electionTimer *time.Timer
+
+	logs        []Entry
+	commitIndex int
+	nextIndex   []int
+	matchIndex  []int
 }
+
+type Entry struct {
+	Term    int32
+	Index   int
+	Command interface{}
+}
+type AppendEntriesArgs struct {
+	Term         int32
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int32
+	Entries      []Entry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term      int32
+	Success   bool
+	nextIndex int //next or conflict index
+}
+
 type RequestVoteArgs struct {
 	Term        int32
 	CandidateID int
@@ -68,6 +93,133 @@ func (rf *Raft) CallElection() { // make yourself candidate, append current term
 	rf.broadcastVoteReq()
 
 	//send a heart beat
+}
+
+func (rf *Raft) broadcastAppendReq() {
+
+	count := 0
+	finished := 0
+
+	for _, othernode := range rf.othernodes {
+		if othernode.me == rf.me {
+			continue
+		}
+		go func(node *Raft) {
+
+			var reply AppendEntriesReply
+			var args AppendEntriesArgs
+			rf.mu.Lock()
+			//fmt.Println("ahb")
+			args.Term = rf.currentterm
+			args.LeaderID = rf.me
+			args.LeaderCommit = rf.commitIndex
+			args.PrevLogIndex = rf.nextIndex[node.me] - 1
+			args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+
+			if (len(rf.logs) - 1) >= rf.nextIndex[node.me] {
+				args.Entries = rf.logs[rf.nextIndex[node.me]:]
+			}
+
+			if len(args.Entries) == 0 {
+				rf.mu.Unlock()
+				//fmt.Println("Append for Node ", node.me, " is up to date")
+				return
+			}
+
+			if rf.state == LEADER {
+				//fmt.Println("ahb")
+				rf.mu.Unlock()
+				node.appendEntries(&args, &reply)
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if reply.Success {
+					rf.nextIndex[node.me] += len(args.Entries)
+					rf.matchIndex[node.me] = rf.nextIndex[node.me] - 1
+					count++
+				} else {
+					if reply.Term > rf.currentterm {
+						rf.currentterm = reply.Term
+						rf.state = FOLLOWER
+						rf.voteAcquired = 0
+					} else if rf.state != LEADER {
+						return
+					} else {
+						if reply.nextIndex > 0 {
+							rf.nextIndex[node.me] = reply.nextIndex
+						}
+					}
+				}
+				fmt.Println("Node ", node.me, " appended ", node.logs)
+				finished++
+			} else {
+				rf.mu.Unlock()
+				return
+			}
+		}(othernode)
+	}
+}
+
+func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	fmt.Println("ahb")
+	//log
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentterm {
+		reply.Success = false
+		reply.Term = rf.currentterm
+		return
+	} else if args.Term > rf.currentterm {
+		if rf.state == LEADER {
+			fmt.Println("Leader ", rf.me, " becomes a follower")
+		}
+		rf.currentterm = args.Term
+		rf.state = FOLLOWER
+		reply.Success = true
+	} else {
+		reply.Success = true
+	}
+
+	if args.PrevLogIndex > (len(rf.logs) - 1) {
+		reply.Success = false
+		reply.nextIndex = (len(rf.logs) - 1) + 1
+		return
+	}
+	if args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term { //wrong data
+		reply.Success = false
+		wrongTerm := rf.logs[args.PrevLogIndex].Term
+		i := args.PrevLogIndex
+		for ; rf.logs[i].Term == wrongTerm; i-- {
+		}
+		reply.nextIndex = i + 1 //overwrite the wrong logs
+		return
+	}
+	wrongIdStart := -1
+	if (len(rf.logs) - 1) == args.PrevLogIndex {
+		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+	} else if (len(rf.logs) - 1) < args.PrevLogIndex+len(args.Entries) { //there are logs already present from present list
+		wrongIdStart = args.PrevLogIndex + 1
+		reply.Success = false
+		reply.nextIndex = wrongIdStart
+	} else { //verify this
+		for id := 0; id < len(args.Entries); id++ {
+			if rf.logs[id+args.PrevLogIndex+1] != args.Entries[id] { //more logs added from wrong term, need to be overwritten
+				wrongIdStart = id + args.PrevLogIndex + 1
+				rf.logs = append(rf.logs[:wrongIdStart], args.Entries[id:]...)
+				break
+			}
+		}
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit < (len(rf.logs) - 1) {
+			rf.commitIndex = (len(rf.logs) - 1)
+		} else {
+			rf.commitIndex = args.LeaderCommit
+		}
+	}
+
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rf.electionTimer.Reset(time.Millisecond * time.Duration(r.Int63n(MAX_ELECTION_INTERVAL-MIN_ELECTION_INTERVAL)+MIN_ELECTION_INTERVAL))
 }
 
 func (rf *Raft) broadcastVoteReq() {
@@ -119,6 +271,10 @@ func (rf *Raft) broadcastVoteReq() {
 		fmt.Println(rf.me, " won election at term ", rf.currentterm)
 		if cterm == rf.currentterm {
 			rf.state = LEADER
+			for i := range rf.othernodes {
+				rf.nextIndex[i] = len(rf.logs)
+				rf.matchIndex[i] = 0
+			}
 		}
 	} else {
 		fmt.Println(rf.me, " lost election at term ", rf.currentterm)
@@ -142,6 +298,9 @@ func (rf *Raft) requestVote(args *RequestVoteArgs, reply *RequestVoteReply) bool
 		reply.Term = rf.currentterm
 		return true
 	} else if args.Term > rf.currentterm {
+		if rf.state == LEADER {
+			fmt.Println("Leader ", rf.me, " becomes a follower")
+		}
 		rf.currentterm = args.Term
 		rf.state = FOLLOWER
 		rf.votedfor = args.CandidateID
@@ -162,25 +321,31 @@ func (rf *Raft) requestVote(args *RequestVoteArgs, reply *RequestVoteReply) bool
 	return false
 }
 
+func (rf *Raft) appendHeartBeat() {
+	rf.broadcastAppendReq()
+	rf.updateCommitIndex()
+}
+
 func (rf *Raft) sendHeartBeat() {
 	w := 0
+
 	for {
+		if atomic.LoadInt32(&rf.state) != LEADER {
+			return
+		}
+		//fmt.Println("sending heartbeat")
+		go rf.appendHeartBeat()
 		for _, othernode := range rf.othernodes {
 			if othernode.me == rf.me {
-				if atomic.LoadInt32(&rf.state) != LEADER {
-					return
-				}
 				continue
 			}
-			othernode.mu.Lock()
-			othernode.heartbeat = 1
-			othernode.mu.Unlock()
+			othernode.receiveHeartBeat()
 		}
 		w++
 		time.Sleep(HEARTBEAT_INTERVAL * time.Millisecond)
-		if w > 200 {
-			time.Sleep(500 * time.Millisecond)
-		}
+		// if w > 200 {
+		// 	time.Sleep(500 * time.Millisecond)
+		// }
 	}
 
 }
@@ -192,9 +357,38 @@ func Make(me int) *Raft {
 	rf.votedfor = -1
 	rf.voteAcquired = 0
 	rf.currentterm = 0
-	rf.heartbeat = 0
 	return rf
 }
+
+func testAppends(value int, nodes []*Raft) {
+	leader := getLeader(nodes)
+	if leader.me != -1 {
+		leader.mu.Lock()
+		entry := Entry{
+			Term:    leader.currentterm,
+			Index:   len(leader.logs),
+			Command: value,
+		}
+		leader.logs = append(leader.logs, entry)
+		leader.mu.Unlock()
+	} else {
+		time.Sleep(500 * time.Millisecond)
+		testAppends(value, nodes)
+	}
+}
+
+func printAllLogs(nodes []*Raft) {
+	fmt.Println("--------------Log Entries----------")
+
+	for _, node := range nodes {
+		node.mu.Lock()
+		fmt.Println()
+		fmt.Println(node.logs)
+		node.mu.Unlock()
+	}
+	fmt.Println("-----------------------------------")
+}
+
 func main() {
 	nodes := []*Raft{}
 	numberOfNodes := 5
@@ -204,11 +398,45 @@ func main() {
 	}
 	for _, node := range nodes {
 		node.othernodes = nodes
+		node.nextIndex = make([]int, len(node.othernodes))
+		node.matchIndex = make([]int, len(node.othernodes))
+		node.logs = make([]Entry, 1)
 		go node.startLoop()
+	}
+	for i := 0; i < 20; i++ {
+		testAppends(i, nodes)
+		fmt.Println("Sending append command: ", i)
+		time.Sleep(10 * time.Millisecond)
+		printAllLogs(nodes)
 	}
 	for {
 	}
 }
+func (rf *Raft) receiveHeartBeat() {
+	switch atomic.LoadInt32(&rf.state) {
+	case CANDIDATE:
+		rf.state = FOLLOWER
+		rf.voteAcquired = 0
+	case LEADER:
+
+		leader := rf.getLeader()
+		if rf.me != leader.me {
+			if atomic.LoadInt32(&rf.currentterm) < atomic.LoadInt32(&leader.currentterm) {
+				rf.mu.Lock()
+				rf.state = FOLLOWER
+				rf.voteAcquired = 0
+				rf.currentterm = atomic.LoadInt32(&leader.currentterm)
+				rf.mu.Unlock()
+				println("Previous leader has now become a follower")
+			}
+		}
+	}
+	rf.mu.Lock()
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rf.electionTimer.Reset(time.Millisecond * time.Duration(r.Int63n(MAX_ELECTION_INTERVAL-MIN_ELECTION_INTERVAL)+MIN_ELECTION_INTERVAL))
+	rf.mu.Unlock()
+}
+
 func (rf *Raft) startLoop() {
 	for {
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -217,32 +445,41 @@ func (rf *Raft) startLoop() {
 		//fmt.Println("exec", rf.me)
 		switch atomic.LoadInt32(&rf.state) {
 		case FOLLOWER:
-			if atomic.LoadInt32(&rf.heartbeat) == 0 {
+			rf.CallElection()
+		}
+	}
+}
 
-				rf.CallElection()
+func (rf *Raft) updateCommitIndex() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for i := len(rf.logs) - 1; i > rf.commitIndex; i-- {
+		count := 1
+		for j, matchedNodeIndex := range rf.matchIndex {
+			if j == rf.me {
+				continue
 			}
-		case CANDIDATE:
-
-			if atomic.LoadInt32(&rf.heartbeat) == 1 {
-				rf.state = FOLLOWER
-				rf.voteAcquired = 0
-			}
-		case LEADER:
-
-			leader := rf.getLeader()
-			if rf.me != leader.me {
-				if atomic.LoadInt32(&rf.currentterm) < atomic.LoadInt32(&leader.currentterm) {
-					rf.mu.Lock()
-					rf.state = FOLLOWER
-					rf.voteAcquired = 0
-					rf.currentterm = atomic.LoadInt32(&leader.currentterm)
-					rf.mu.Unlock()
-					println("Previous leader has now become a follower")
-				}
+			if matchedNodeIndex > rf.commitIndex {
+				count++
 			}
 		}
-		atomic.StoreInt32(&rf.heartbeat, 0)
+		if count > (len(rf.othernodes)+1)/2 {
+			rf.commitIndex = i
+
+		} else {
+			break
+		}
 	}
+}
+func getLeader(nodes []*Raft) *Raft {
+	for _, node := range nodes {
+		if atomic.LoadInt32(&node.state) == LEADER {
+			return node
+		}
+	}
+	rf1 := &Raft{}
+	rf1.me = -1
+	return rf1
 }
 
 func (rf *Raft) getLeader() *Raft {
