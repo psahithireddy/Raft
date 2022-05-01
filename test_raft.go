@@ -31,10 +31,12 @@ type Raft struct {
 	voteAcquired  int
 	electionTimer *time.Timer
 
-	logs        []Entry
-	commitIndex int
-	nextIndex   []int
-	matchIndex  []int
+	logs              []Entry
+	commitIndex       int
+	nextIndex         []int
+	matchIndex        []int
+	doNotBecomeLeader bool //only for testing
+	doNotAppend       bool //only for testing
 }
 
 type Entry struct {
@@ -58,8 +60,10 @@ type AppendEntriesReply struct {
 }
 
 type RequestVoteArgs struct {
-	Term        int32
-	CandidateID int
+	Term         int32
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int32
 }
 
 type RequestVoteReply struct {
@@ -83,10 +87,15 @@ func (rf *Raft) GetState() (int32, bool) {
 
 func (rf *Raft) CallElection() { // make yourself candidate, append current term, vote for yourself and
 	rf.mu.Lock() // take votes from other nodes
+	if rf.doNotAppend {
+		rf.mu.Unlock()
+		return
+	}
 	rf.state = CANDIDATE
 	rf.currentterm++
 	rf.votedfor = rf.me //need to enter me details
 	fmt.Println(rf.me, " is attempting election at term", rf.currentterm)
+
 	rf.mu.Unlock()
 
 	// request votes
@@ -116,15 +125,22 @@ func (rf *Raft) broadcastAppendReq() {
 			args.PrevLogIndex = rf.nextIndex[node.me] - 1
 			args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 
+			if node.doNotAppend {
+				rf.mu.Unlock()
+				return
+			}
+			// if node.me == 4 {
+			// 	fmt.Println("append on node 4", node.logs)
+			// }
 			if (len(rf.logs) - 1) >= rf.nextIndex[node.me] {
 				args.Entries = rf.logs[rf.nextIndex[node.me]:]
 			}
 
-			if len(args.Entries) == 0 {
-				rf.mu.Unlock()
-				//fmt.Println("Append for Node ", node.me, " is up to date")
-				return
-			}
+			// if len(args.Entries) == 0 {
+			// 	rf.mu.Unlock()
+			// 	//fmt.Println("Append for Node ", node.me, " is up to date")
+			// 	return
+			// }
 
 			if rf.state == LEADER {
 				//fmt.Println("ahb")
@@ -149,7 +165,9 @@ func (rf *Raft) broadcastAppendReq() {
 						}
 					}
 				}
-				fmt.Println("Node ", node.me, " appended ", node.logs)
+				if reply.Success {
+					fmt.Println("Node ", node.me, " appended ", node.logs)
+				}
 				finished++
 			} else {
 				rf.mu.Unlock()
@@ -160,7 +178,7 @@ func (rf *Raft) broadcastAppendReq() {
 }
 
 func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	fmt.Println("ahb")
+	//fmt.Println("ahb")
 	//log
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -196,7 +214,11 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	wrongIdStart := -1
 	if (len(rf.logs) - 1) == args.PrevLogIndex {
-		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+		if len(args.Entries) == 0 {
+			reply.Success = false
+		} else {
+			rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+		}
 	} else if (len(rf.logs) - 1) < args.PrevLogIndex+len(args.Entries) { //there are logs already present from present list
 		wrongIdStart = args.PrevLogIndex + 1
 		reply.Success = false
@@ -236,11 +258,15 @@ func (rf *Raft) broadcastVoteReq() {
 		}
 		go func(node *Raft) {
 			var reply RequestVoteReply
+			rf.mu.Lock()
 			args := RequestVoteArgs{
-				Term:        rf.currentterm,
-				CandidateID: rf.me,
+				Term:         rf.currentterm,
+				CandidateID:  rf.me,
+				LastLogIndex: (len(rf.logs) - 1),
+				LastLogTerm:  rf.logs[(len(rf.logs) - 1)].Term,
 			}
-			if rf.state == CANDIDATE && node.requestVote(&args, &reply) {
+			rf.mu.Unlock()
+			if atomic.LoadInt32(&rf.state) == CANDIDATE && node.requestVote(&args, &reply) {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if reply.VoteGranted {
@@ -292,6 +318,14 @@ func (rf *Raft) requestVote(args *RequestVoteArgs, reply *RequestVoteReply) bool
 	//log
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	currentLastLogTerm := rf.logs[(len(rf.logs) - 1)].Term
+	if currentLastLogTerm > args.LastLogTerm {
+		reply.VoteGranted = false
+		return true
+	} else if (len(rf.logs) - 1) < args.LastLogIndex {
+		reply.VoteGranted = false
+		return true
+	}
 
 	if args.Term < rf.currentterm {
 		reply.VoteGranted = false
@@ -343,9 +377,9 @@ func (rf *Raft) sendHeartBeat() {
 		}
 		w++
 		time.Sleep(HEARTBEAT_INTERVAL * time.Millisecond)
-		// if w > 200 {
-		// 	time.Sleep(500 * time.Millisecond)
-		// }
+		if w > 200 {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 
 }
@@ -360,58 +394,6 @@ func Make(me int) *Raft {
 	return rf
 }
 
-func testAppends(value int, nodes []*Raft) {
-	leader := getLeader(nodes)
-	if leader.me != -1 {
-		leader.mu.Lock()
-		entry := Entry{
-			Term:    leader.currentterm,
-			Index:   len(leader.logs),
-			Command: value,
-		}
-		leader.logs = append(leader.logs, entry)
-		leader.mu.Unlock()
-	} else {
-		time.Sleep(500 * time.Millisecond)
-		testAppends(value, nodes)
-	}
-}
-
-func printAllLogs(nodes []*Raft) {
-	fmt.Println("--------------Log Entries----------")
-
-	for _, node := range nodes {
-		node.mu.Lock()
-		fmt.Println()
-		fmt.Println(node.logs)
-		node.mu.Unlock()
-	}
-	fmt.Println("-----------------------------------")
-}
-
-func main() {
-	nodes := []*Raft{}
-	numberOfNodes := 5
-	for i := 0; i < numberOfNodes; i++ {
-		rf := Make(i)
-		nodes = append(nodes, rf)
-	}
-	for _, node := range nodes {
-		node.othernodes = nodes
-		node.nextIndex = make([]int, len(node.othernodes))
-		node.matchIndex = make([]int, len(node.othernodes))
-		node.logs = make([]Entry, 1)
-		go node.startLoop()
-	}
-	for i := 0; i < 20; i++ {
-		testAppends(i, nodes)
-		fmt.Println("Sending append command: ", i)
-		time.Sleep(10 * time.Millisecond)
-		printAllLogs(nodes)
-	}
-	for {
-	}
-}
 func (rf *Raft) receiveHeartBeat() {
 	switch atomic.LoadInt32(&rf.state) {
 	case CANDIDATE:
@@ -445,6 +427,9 @@ func (rf *Raft) startLoop() {
 		//fmt.Println("exec", rf.me)
 		switch atomic.LoadInt32(&rf.state) {
 		case FOLLOWER:
+			if rf.doNotBecomeLeader {
+				continue
+			}
 			rf.CallElection()
 		}
 	}
@@ -491,4 +476,75 @@ func (rf *Raft) getLeader() *Raft {
 	rf1 := &Raft{}
 	rf1.me = -1
 	return rf1
+}
+
+func testAppends(value int, nodes []*Raft) {
+	leader := getLeader(nodes)
+	if leader.me != -1 {
+		leader.mu.Lock()
+		entry := Entry{
+			Term:    leader.currentterm,
+			Index:   len(leader.logs),
+			Command: value,
+		}
+		leader.logs = append(leader.logs, entry)
+		leader.mu.Unlock()
+	} else {
+		time.Sleep(500 * time.Millisecond)
+		testAppends(value, nodes)
+	}
+}
+
+func printAllLogs(nodes []*Raft) {
+	fmt.Println("--------------Log Entries----------")
+
+	for _, node := range nodes {
+		node.mu.Lock()
+		fmt.Println()
+		fmt.Println(node.logs)
+		node.mu.Unlock()
+	}
+	fmt.Println("-----------------------------------")
+}
+
+func main() {
+	nodes := []*Raft{}
+	numberOfNodes := 5
+	for i := 0; i < numberOfNodes; i++ {
+		rf := Make(i)
+		nodes = append(nodes, rf)
+	}
+	for _, node := range nodes {
+		node.othernodes = nodes
+		node.nextIndex = make([]int, len(node.othernodes))
+		node.matchIndex = make([]int, len(node.othernodes))
+		node.logs = make([]Entry, 1)
+		node.doNotAppend = false
+		if node.me != 4 {
+			node.doNotBecomeLeader = false
+		} else {
+			node.doNotBecomeLeader = true
+		}
+		go node.startLoop()
+	}
+	for i := 0; i < 20; i++ {
+		testAppends(i, nodes)
+		fmt.Println("Sending append command: ", i)
+		time.Sleep(10 * time.Millisecond)
+		printAllLogs(nodes)
+	}
+	time.Sleep(10 * time.Millisecond)
+	nodes[4].doNotAppend = true
+	time.Sleep(time.Duration(1000) * time.Millisecond)
+	for i := 20; i < 40; i++ {
+		testAppends(i, nodes)
+		fmt.Println("Sending append command: ", i)
+		time.Sleep(10 * time.Millisecond)
+		printAllLogs(nodes)
+	}
+	time.Sleep(time.Duration(10000) * time.Millisecond)
+	nodes[4].doNotAppend = false
+	fmt.Println("DonotAppend made false")
+	for {
+	}
 }
