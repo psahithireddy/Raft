@@ -177,7 +177,9 @@ func (rf *Raft) broadcastAppendReq() {
 				if reply.Success {
 					fmt.Println()
 					fmt.Println()
+
 					fmt.Println("Node ", node.me, " appended ", node.logs)
+					fmt.Println("LEADER commitIndex: ", rf.commitIndex)
 				}
 				finished++
 			} else {
@@ -388,7 +390,7 @@ func (rf *Raft) sendHeartBeat() {
 			othernode.receiveHeartBeat()
 		}
 		w++
-		time.Sleep(HEARTBEAT_INTERVAL * time.Millisecond)
+		time.Sleep(HEARTBEAT_INTERVAL * time.Millisecond) //manual delay for testing
 		if w > 200 {
 			time.Sleep(500 * time.Millisecond)
 		}
@@ -533,8 +535,14 @@ func printAllLogs(nodes []*Raft) {
 		node.mu.Lock()
 		fmt.Println()
 		fmt.Println(node.logs)
+		if node.state == LEADER {
+			fmt.Println()
+			fmt.Println("Leader Commit at:", node.commitIndex)
+			fmt.Println()
+		}
 		node.mu.Unlock()
 	}
+
 	fmt.Println("-----------------------------------")
 }
 
